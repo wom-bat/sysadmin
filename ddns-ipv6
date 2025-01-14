@@ -1,0 +1,114 @@
+#!/bin/sh
+# Copyright 2025 Peter Chubb
+# SPDX-License-Identifier: GPL-3.0
+#
+# Add or delete an IPv6 address record via DDNS
+# Uses nsupdate and ipv6calc
+#
+# Adjust these for your network.
+PFX="2401:d002::"
+
+# don't forget trailing dot
+DOMAIN=example.com.
+KEYFILE=/etc/bind/nsupdate.key
+TTL=7200
+
+# DEBUG
+#exec 2>> /tmp/ddns-ipv6-log >&2
+#set -x
+#echo >&2 "$@"
+
+# Following is in an asynchronous subshell
+# so it can take a longer time while
+# DHCPD assigns the address.
+(
+
+
+# May need /usr/local/[s]bin here too.
+# But don't rely on the PATH handed in, because we may be 
+# run by a privileged user
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+export PATH
+
+
+# Can put onto different subnets based on 
+# the IP4 address
+getprefix()
+{
+	case "$1" in
+	192.168.*)
+	    echo $PFX
+	    ;;
+        esac
+}
+
+# Function to get auto-allocated EUI-64 address
+ipv6addr()
+{
+	tail=`ipv6calc --action geneui64 --in mac $3 --out eui64`
+	echo $1:$tail
+}
+
+
+Usage()
+{
+	echo >&2 "Usage: `basename $0` -d name"
+	echo >&2 "       `basename $0` name mac ipv4addr"
+	exit 1
+}
+
+case "$1" in
+-d)
+	DELETE=1;
+	shift
+	;;
+-*)
+	Usage
+	;;
+*)
+	;;
+esac
+
+
+if [ "$DELETE" ]
+then
+	if [ $# -ne 1 ] ; then
+	   Usage
+	fi
+        IPADDR=`host -t aaaa "$1" | sed -n s'/.*address \(.*\)$/\1/p'`
+	[ "$IPADDR" ] || exit 1
+	PTR=`ipv6calc --in ipv6addr --out revnibbles.arpa "$IPADDR"`
+	nsupdate -k "$KEYFILE" <<-!
+		 server localhost
+		 update delete $1.$DOMAIN IN AAAA $IPADDR
+		 send
+		 update delete $PTR IN CNAME $1.$DOMAIN
+		 send
+!
+else
+	if [ $# -ne 3 ]; then
+		Usage
+	fi
+	PFX=`getprefix $3`
+	IPADDR=`ipv6addr $PFX $1 $2`
+	# Windows machines (and some Linux machines) do anonymisation
+	# so have a different ipv6 address.  so check if the one
+	# we calculated is responding to pings.
+	# the sleep gives time for the interface to continue coming up
+	# as we're usually being called from dhcpd and the IPv6 ninterface may
+	# still be being allocated via radvd
+	if [ "$IPADDR " ] && { sleep 2; ping6 -c 1 $IPADDR > /dev/null 2>&1; }
+	then
+		PTR=`ipv6calc --in ipv6addr --out revnibbles.arpa "$IPADDR"`
+		: $1.$DOMAIN '<->' $IPADDR
+		nsupdate -k "$KEYFILE" <<-!
+			server localhost
+			update add $1.$DOMAIN $TTL IN AAAA $IPADDR
+			send
+			update add $PTR $TTL IN PTR $1.$DOMAIN
+			send
+!
+	fi
+fi
+) &
+exit 0
